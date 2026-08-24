@@ -512,7 +512,7 @@ def test_kubernetes_pod_declares_the_termination_grace_period(monkeypatch):
     deployer._materials = {}
     deployer._client = None
     deployer._node_name = None
-    deployer._image_pull_secret = None
+    deployer._image_pull_secrets = {}
     deployer._mutate_create_pod = lambda pod: pod
 
     workload = KubernetesWorkloadPlan(

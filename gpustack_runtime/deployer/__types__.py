@@ -236,13 +236,19 @@ class ContainerExecution(ContainerSecurity):
 @dataclass
 class ContainerResources(dict[str, float | int | str]):
     """
-    Resources for a container.
+    Resources for a container, as a mapping from resource key to quantity,
+    e.g. {"cpu": 2, "memory": "4Gi", "nvidia.com/gpu": "0,1"}.
+
+    A container declares them twice at most, once as what it requests and once
+    as what it is limited to, see `Container.resources` and
+    `Container.resources_limits`: declaring one side only requests and limits
+    the same quantities, which is what a container has always got.
 
     Attributes:
         cpu (float | None):
-            CPU limit for the container in cores.
+            CPU for the container in cores.
         memory (str | int | float | None):
-            Memory limit for the container.
+            Memory for the container.
 
     """
 
@@ -667,6 +673,9 @@ class Container:
             Environment variables of the container.
         resources (ContainerResources | None):
             Resources specification of the container.
+        resources_limits (ContainerResources | None):
+            Resources the container is limited to,
+            which default to the resources it requests.
         files (list[ContainerFile] | None):
             Files of the container.
         mounts (list[ContainerMount] | None):
@@ -718,7 +727,21 @@ class Container:
         metadata={"dataclasses_json": {"encoder": lambda v: dict(v) if v else None}},
     )
     """
-    Resources specification of the container.
+    Resources specification of the container,
+    which are the resources it requests,
+    and the resources it is limited to unless `resources_limits` declares them.
+    """
+    resources_limits: ContainerResources | None = field(
+        default=None,
+        metadata={"dataclasses_json": {"encoder": lambda v: dict(v) if v else None}},
+    )
+    """
+    Resources the container is limited to,
+    which default to the resources it requests when left unset,
+    i.e. the container is limited to exactly what it asks for.
+    Declaring more than `resources` lets the container burst above its request,
+    and only the compute resources may differ:
+    a device, handed out as a whole, is requested and limited alike.
     """
     files: list[ContainerFile] | None = None
     """
@@ -762,6 +785,33 @@ class Container:
                 else self.name
             )
         return self._name_rfc1123_guard
+
+    def resolve_resources(
+        self,
+    ) -> tuple[ContainerResources | None, ContainerResources | None]:
+        """
+        Resolve the resources the container requests and the resources it is
+        limited to.
+
+        A container declaring one side only requests and is limited to the same
+        resources, which is exactly what every container has got so far, so a
+        workload declaring no limits deploys unchanged.
+
+        Returns:
+            The resources requested and the resources limited to,
+            which are the same object when the container declares one side
+            only, and None when it declares neither.
+
+        """
+        requests = (
+            self.resources if self.resources is not None else self.resources_limits
+        )
+        limits = (
+            self.resources_limits
+            if self.resources_limits is not None
+            else self.resources
+        )
+        return requests, limits
 
 
 @dataclass
@@ -850,6 +900,8 @@ class WorkloadPlan(WorkloadSecurity):
             Name for the workload, it should be unique in the deployer.
         labels (dict[str, str] | None):
             Labels for the workload.
+        annotations (dict[str, str] | None):
+            Annotations for the workload.
         instance_type (str | None):
             Name of the operator InstanceType the workload deploys onto.
         host_network (bool):
@@ -888,6 +940,13 @@ class WorkloadPlan(WorkloadSecurity):
     labels: dict[str, str] | None = None
     """
     Labels for the workload.
+    """
+    annotations: dict[str, str] | None = None
+    """
+    Annotations for the workload,
+    which carry the settings selecting them by value rather than by key,
+    e.g. the size of the gang a workload is admitted as.
+    Deployers without a concept of annotations ignore them.
     """
     instance_type: str | None = None
     """
@@ -985,6 +1044,15 @@ class WorkloadPlan(WorkloadSecurity):
             for s in ln.split("/"):
                 validate_label_name_segment(s)
             validate_label_value(lv)
+
+        # Default and validate workload annotations, whose names follow the
+        # same rules as label names, while their values are free-form: that is
+        # what makes an annotation the place for a setting a label cannot hold.
+        if self.annotations is None:
+            self.annotations = {}
+        for an in self.annotations:
+            for s in an.split("/"):
+                validate_label_name_segment(s)
 
         # Validate container names and images.
         container_names = []

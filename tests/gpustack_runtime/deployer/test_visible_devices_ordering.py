@@ -188,7 +188,7 @@ def _kubernetes_container_envs(
     deployer = _deployer(KubernetesDeployer, materials)
     deployer._client = None
     deployer._node_name = None
-    deployer._image_pull_secret = None
+    deployer._image_pull_secrets = {}
     deployer._mutate_create_pod = lambda pod: pod
 
     workload = KubernetesWorkloadPlan(

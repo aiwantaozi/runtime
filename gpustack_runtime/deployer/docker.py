@@ -54,6 +54,7 @@ from .__utils__ import (
     adjust_image_with_envs,
     bytes_to_human_readable,
     isexception,
+    memory_quantity,
     safe_json,
     sensitive_env_var,
 )
@@ -993,14 +994,15 @@ class DockerDeployer(EndoscopicDeployer):
             }
 
             # Parameterize resources.
-            if c.resources:
+            c_requests, c_limits = c.resolve_resources()
+            if c_requests:
                 cdi = (
                     envs.GPUSTACK_RUNTIME_DOCKER_RESOURCE_INJECTION_POLICY.lower()
                     == "cdi"
                 )
                 fmt = "plain" if not cdi else "cdi"
 
-                for r_k, r_v in c.resources.items():
+                for r_k, r_v in c_requests.items():
                     if r_k == "cpu":
                         if isinstance(r_v, int | float):
                             create_options["cpu_shares"] = ceil(r_v * 1024)
@@ -1008,15 +1010,17 @@ class DockerDeployer(EndoscopicDeployer):
                             create_options["cpu_shares"] = ceil(float(r_v) * 1024)
                         continue
                     if r_k == "memory":
-                        if isinstance(r_v, int):
-                            create_options["mem_limit"] = r_v
-                            create_options["mem_reservation"] = r_v
-                            create_options["memswap_limit"] = r_v
-                        elif isinstance(r_v, str):
-                            v = r_v.lower().removesuffix("i")
-                            create_options["mem_limit"] = v
-                            create_options["mem_reservation"] = v
-                            create_options["memswap_limit"] = v
+                        # A container runtime reserves what the container
+                        # requests and caps it at what it is limited to, which
+                        # are the same quantity unless the container declares
+                        # them apart.
+                        reservation = memory_quantity(r_v)
+                        limit = memory_quantity(c_limits.get(r_k, r_v))
+                        if reservation is not None:
+                            create_options["mem_reservation"] = reservation
+                        if limit is not None:
+                            create_options["mem_limit"] = limit
+                            create_options["memswap_limit"] = limit
                         continue
 
                     if (

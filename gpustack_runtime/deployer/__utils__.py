@@ -722,6 +722,28 @@ def bytes_to_human_readable(size_in_bytes: int) -> str:
     return f"{size_in_bytes} B"
 
 
+def memory_quantity(value: float | str | None) -> int | str | None:
+    """
+    Convert a memory quantity into what a container runtime accepts,
+    which spells the binary suffixes without the trailing "i",
+    e.g. "4Gi" becomes "4g".
+
+    Args:
+        value:
+            The memory quantity to convert.
+
+    Returns:
+        The converted quantity,
+        None if the quantity is not one a container runtime accepts.
+
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return value.lower().removesuffix("i")
+    return None
+
+
 def sensitive_env_var(name: str) -> bool:
     """
     Check if the given environment variable name is considered sensitive.

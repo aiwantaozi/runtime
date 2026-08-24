@@ -27,6 +27,7 @@ from .__types__ import (
     Container,
     ContainerPort,
     ContainerProfileEnum,
+    ContainerResources,
     EndoscopicDeployer,
     UnsupportedError,
     WorkloadExecStream,
@@ -58,7 +59,75 @@ clogger = logger.getChild("conversion")
 _LABEL_WORKLOAD = f"{envs.GPUSTACK_RUNTIME_DEPLOY_LABEL_PREFIX}/workload"
 _LABEL_COMPONENT = f"{envs.GPUSTACK_RUNTIME_DEPLOY_LABEL_PREFIX}/component"
 
+_LABEL_KUEUE_QUEUE_NAME = "kueue.x-k8s.io/queue-name"
+"""
+Label naming the Kueue LocalQueue admitting the Pod.
+"""
+_LABEL_KUEUE_POD_GROUP_NAME = "kueue.x-k8s.io/pod-group-name"
+"""
+Label naming the Kueue Pod group the Pod belongs to,
+i.e. the gang admitted as a whole.
+"""
+_ANNOTATION_KUEUE_POD_GROUP_TOTAL_COUNT = "kueue.x-k8s.io/pod-group-total-count"
+"""
+Annotation carrying how many Pods the Kueue Pod group counts,
+which Kueue waits for before admitting the gang.
+"""
+_ANNOTATION_PREFERRED_DEVICE_INDEX = "device.gpustack.ai/accelerator.preferred-index"
+"""
+Annotation selecting the devices the GPUStack device plugin allocates.
+"""
+
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+_WORKLOAD_NAMESPACE_PREFIX = "gpustack-"
+"""
+Prefix of the namespaces holding workloads, one per organization, e.g.
+"gpustack-default". A worker hosts the workloads of several organizations, so
+the namespace belongs to the workload rather than to the deployer, and an
+operation carrying a name only searches these namespaces instead of assuming
+the namespace the deployer itself runs in -- which is also the namespace Kueue
+structurally cannot admit workloads in, as it excludes its own.
+"""
+
+
+def _default_workload_namespace() -> WorkloadNamespace:
+    """
+    Return the namespace a workload lands in when it declares none.
+
+    This is the single source of the namespace fallback: every operation
+    resolving a workload namespace ends up here, so a deployment declaring no
+    namespace anywhere keeps deploying, reading and deleting where it always
+    has.
+
+    Returns:
+        The configured default namespace.
+
+    """
+    return envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
+
+
+def _is_workload_namespace(namespace: WorkloadNamespace | None) -> bool:
+    """
+    Report whether the given namespace may hold workloads, which the
+    per-organization namespaces do, and so does the configured default: a
+    single-namespace deployment holds its workloads there.
+
+    Args:
+        namespace:
+            The namespace to judge.
+
+    Returns:
+        True if the namespace may hold workloads, False otherwise.
+
+    """
+    if not namespace:
+        return False
+    return (
+        namespace.startswith(_WORKLOAD_NAMESPACE_PREFIX)
+        or namespace == _default_workload_namespace()
+    )
+
 
 _IMAGE_PULL_BLOCKED_REASONS = frozenset(
     {
@@ -122,6 +191,9 @@ class KubernetesWorkloadPlan(WorkloadPlan):
             it should be unique in the deployer.
         labels (dict[str, str] | None):
             Labels to attach to the workload.
+        annotations (dict[str, str] | None):
+            Annotations to attach to the workload,
+            which land on the Pod.
         host_network (bool):
             Indicates if the containers of the workload use the host network.
         host_ipc (bool):
@@ -178,7 +250,7 @@ class KubernetesWorkloadPlan(WorkloadPlan):
 
         # Validate namespace
         if not self.namespace:
-            self.namespace = envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
+            self.namespace = _default_workload_namespace()
         try:
             validate_rfc1123_domain_name(self.namespace)
         except ValueError as e:
@@ -530,7 +602,7 @@ def _apply_instance_type_admission(
         return
     if envs.GPUSTACK_RUNTIME_KUBERNETES_KDP_NO_KUEUE_ADMISSION:
         return
-    pod.metadata.labels["kueue.x-k8s.io/queue-name"] = (
+    pod.metadata.labels[_LABEL_KUEUE_QUEUE_NAME] = (
         f"gpustack-fnv64-{fnv1a_64_hex(instance_type)}"
     )
 
@@ -549,7 +621,7 @@ def _pin_pod_for_kueue(
     """
     if not node_name:
         return
-    if "kueue.x-k8s.io/queue-name" not in (pod.metadata.labels or {}):
+    if _LABEL_KUEUE_QUEUE_NAME not in (pod.metadata.labels or {}):
         return
     pod.spec.node_name = None
     pod.spec.node_selector = {
@@ -568,6 +640,80 @@ def _is_device_plugin_resource(resource_key: str) -> bool:
     return any(
         resource_key == cdi or resource_key.startswith(f"{cdi}.")
         for cdi in envs.GPUSTACK_RUNTIME_DEPLOY_RESOURCE_KEY_MAP_CDI.values()
+    )
+
+
+def _is_overcommittable_resource(resource_key: str) -> bool:
+    """
+    Report whether a resource key may request and limit different quantities,
+    which only the native compute resources may: Kubernetes requires an
+    extended resource -- every device plugin resource among them -- to request
+    and limit the same quantity, and rejects the Pod declaring otherwise.
+    """
+    return resource_key in (
+        "cpu",
+        "memory",
+        "ephemeral-storage",
+    ) or resource_key.startswith("hugepages-")
+
+
+def _container_resource_requirements(
+    container_name: str,
+    requests: dict[str, str],
+    limits: ContainerResources | None,
+) -> kubernetes.client.V1ResourceRequirements:
+    """
+    Build the resource requirements of a Container from the resources it
+    requests and the resources it is limited to.
+
+    A container declaring no limits of its own is limited to what it requests,
+    which makes it Guaranteed, as every container has been so far. Declaring
+    them apart makes it Burstable, which is the point of declaring them at all.
+
+    Args:
+        container_name:
+            The name of the container, for reporting.
+        requests:
+            The resources the container requests, as converted for the Pod.
+        limits:
+            The resources the container is limited to, as declared.
+
+    Returns:
+        The resource requirements of the container.
+
+    """
+    if not requests:
+        return kubernetes.client.V1ResourceRequirements(
+            limits=None,
+            requests=None,
+        )
+
+    resolved_limits = dict(requests)
+    for l_k, l_v in (limits or {}).items():
+        if l_k not in resolved_limits:
+            # A mapped device request never reaches the Pod as a resource, e.g.
+            # under the env injection policy it becomes a visible-devices env,
+            # so a limit on it has nothing to limit.
+            continue
+        l_v = str(l_v)  # noqa: PLW2901
+        if l_v == resolved_limits[l_k]:
+            continue
+        if not _is_overcommittable_resource(l_k):
+            clogger.warning(
+                "Container '%s' limits resource '%s' to %s but requests %s, "
+                "which Kubernetes rejects for an extended resource: "
+                "limiting it to what it requests",
+                container_name,
+                l_k,
+                l_v,
+                resolved_limits[l_k],
+            )
+            continue
+        resolved_limits[l_k] = l_v
+
+    return kubernetes.client.V1ResourceRequirements(
+        limits=resolved_limits,
+        requests=dict(requests),
     )
 
 
@@ -686,10 +832,11 @@ def _resolve_privileged(container: Container, kdp: bool) -> bool:
     """
     if not container.execution or not container.execution.privileged:
         return False
-    if not container.resources:
+    requests, _ = container.resolve_resources()
+    if not requests:
         return True
 
-    for r_k in container.resources:
+    for r_k in requests:
         if r_k in ("cpu", "memory"):
             continue
         if _is_device_plugin_resource(r_k) or (
@@ -723,9 +870,12 @@ class KubernetesDeployer(EndoscopicDeployer):
     """
     Name of the node where the deployer is running.
     """
-    _image_pull_secret: str | None = None
+    _image_pull_secrets: dict[WorkloadNamespace, str] | None = None
     """
-    Image pull secret for pulling container images.
+    Image pull secrets for pulling container images, keyed by the namespace
+    they have been applied into: a Pod can only reference a Secret of its own
+    namespace, so a deployer serving several workload namespaces holds one
+    copy per namespace instead of a single one.
     """
     _mutate_create_pod: (
         Callable[[kubernetes.client.V1Pod], kubernetes.client.V1Pod] | None
@@ -1162,11 +1312,54 @@ class KubernetesDeployer(EndoscopicDeployer):
             msg = "Failed to get the default node name of the cluster: No nodes found"
             raise OperationError(msg)
 
+    def _apply_default_image_pull_secret(
+        self,
+        namespace: WorkloadNamespace,
+    ) -> str | None:
+        """
+        Apply the image pull secret of the default container registry into the
+        given namespace, if credentials for it are configured.
+
+        Applied per workload namespace rather than once per deployer: a Pod can
+        only reference a Secret of its own namespace, so the credentials of the
+        default registry need one copy in every namespace deploying a workload
+        pulling from it.
+
+        Args:
+            namespace:
+                The namespace of the workload to pull for.
+
+        Returns:
+            The name of the applied image pull secret,
+            None if no default registry credentials are configured.
+
+        Raises:
+            OperationError:
+                If applying the image pull secret fails.
+
+        """
+        if not (
+            envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME
+            and envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD
+        ):
+            return None
+
+        registry = (
+            envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY or "index.docker.io"
+        )
+        return self._apply_image_pull_secret(
+            registry=f"https://{registry}/v1/",
+            username=envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME,
+            password=envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD,
+            namespace=namespace,
+        )
+
     def _apply_image_pull_secret(
         self,
         registry: str,
         username: str,
         password: str,
+        namespace: WorkloadNamespace,
     ) -> str:
         """
         Apply image pull secret for pulling container images.
@@ -1178,6 +1371,10 @@ class KubernetesDeployer(EndoscopicDeployer):
                 The username for the container registry.
             password:
                 The password for the container registry.
+            namespace:
+                The namespace to apply the image pull secret into,
+                which is the namespace of the Pod referencing it: Kubernetes
+                resolves an image pull secret in the Pod's own namespace only.
 
         Returns:
             The name of the created image pull secret.
@@ -1205,7 +1402,13 @@ class KubernetesDeployer(EndoscopicDeployer):
         docker_config_json_b64 = base64_encode(docker_config_json)
 
         secret_name = f"gpustack-ips-{fnv1a_64_hex(registry + auth_b64)}"
-        secret_namespace = envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
+        secret_namespace = namespace
+
+        # The name hashes the credentials, so a Secret this deployer has
+        # already applied under that name in that namespace carries them
+        # unchanged: reapplying it would only spend API calls.
+        if (self._image_pull_secrets or {}).get(secret_namespace) == secret_name:
+            return secret_name
 
         secret = kubernetes.client.V1Secret(
             metadata=kubernetes.client.V1ObjectMeta(
@@ -1249,6 +1452,11 @@ class KubernetesDeployer(EndoscopicDeployer):
         except kubernetes.client.exceptions.ApiException as e:
             msg = f"Failed to create image pull secret{_detail_api_call_error(e)}"
             raise OperationError(msg) from e
+
+        self._image_pull_secrets = {
+            **(self._image_pull_secrets or {}),
+            secret_namespace: secret_name,
+        }
 
         return secret_name
 
@@ -1369,7 +1577,10 @@ class KubernetesDeployer(EndoscopicDeployer):
                 name=pod_name,
                 namespace=workload.namespace,
                 labels=workload.labels or {},
-                annotations={},
+                # Copied rather than referenced: the conversion stamps its own
+                # annotations onto the Pod, e.g. the container names, and must
+                # not write them back into the plan it is given.
+                annotations=dict(workload.annotations or {}),
             ),
             spec=kubernetes.client.V1PodSpec(
                 containers=[],
@@ -1412,6 +1623,11 @@ class KubernetesDeployer(EndoscopicDeployer):
         )
 
         # Create dedicated image pull secret if needed, and attach to the Pod.
+        # Applied here rather than while preparing the deployer, as the
+        # namespace to copy the Secret into is only known once the workload
+        # plan has defaulted it, and a Pod resolves an image pull secret in its
+        # own namespace only.
+        image_pull_secret = self._apply_default_image_pull_secret(workload.namespace)
         for c in workload.containers:
             if c.profile != ContainerProfileEnum.RUN:
                 continue
@@ -1430,17 +1646,20 @@ class KubernetesDeployer(EndoscopicDeployer):
                 if usernm and passwd:
                     reg, _, _, _ = parse_image(c.image)
                     reg = reg or "index.docker.io"
-                    self._image_pull_secret = self._apply_image_pull_secret(
+                    # Credentials the workload carries itself win over the
+                    # configured default ones.
+                    image_pull_secret = self._apply_image_pull_secret(
                         registry=f"https://{reg}/v1/",
                         username=usernm,
                         password=passwd,
+                        namespace=workload.namespace,
                     )
                     break
 
-        if self._image_pull_secret:
+        if image_pull_secret:
             pod.spec.image_pull_secrets = [
                 kubernetes.client.V1LocalObjectReference(
-                    name=self._image_pull_secret,
+                    name=image_pull_secret,
                 ),
             ]
 
@@ -1509,11 +1728,12 @@ class KubernetesDeployer(EndoscopicDeployer):
             ]
 
             # Parameterize resources
-            if c.resources:
+            c_requests, c_limits = c.resolve_resources()
+            if c_requests:
                 fmt = "kdp" if kdp else "plain"
 
                 resources: dict[str, str] = {}
-                for r_k, r_v in c.resources.items():
+                for r_k, r_v in c_requests.items():
                     if r_k in ("cpu", "memory"):
                         resources[r_k] = str(r_v)
                         continue
@@ -1575,7 +1795,7 @@ class KubernetesDeployer(EndoscopicDeployer):
                                 )
                                 # Manually select devices via annotation for KDP.
                                 pod.metadata.annotations[
-                                    "device.gpustack.ai/accelerator.preferred-index"
+                                    _ANNOTATION_PREFERRED_DEVICE_INDEX
                                 ] = ",".join(resource_values)
                                 # Request quantity of devices as resources for KDP to schedule on the correct nodes.
                                 resources.update(r_vs)
@@ -1648,9 +1868,10 @@ class KubernetesDeployer(EndoscopicDeployer):
                             ],
                         )
 
-                container.resources = kubernetes.client.V1ResourceRequirements(
-                    limits=(resources if resources else None),
-                    requests=(resources if resources else None),
+                container.resources = _container_resource_requirements(
+                    container_name,
+                    resources,
+                    c_limits,
                 )
 
             # Parameterize mounts
@@ -1779,6 +2000,7 @@ class KubernetesDeployer(EndoscopicDeployer):
         super().__init__(_NAME)
         self._client = self._get_client()
         self._node_name = envs.GPUSTACK_RUNTIME_KUBERNETES_NODE_NAME
+        self._image_pull_secrets = {}
         self._runtime_uuid_values_allowed: bool | None = None
 
     @property
@@ -1813,20 +2035,10 @@ class KubernetesDeployer(EndoscopicDeployer):
         if not self._node_name:
             self._node_name = self._get_default_node_name()
 
-        # Create image pull secrets if default registry credentials are set.
-        if not self._image_pull_secret and (
-            envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME
-            and envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD
-        ):
-            registry = (
-                envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY
-                or "index.docker.io"
-            )
-            self._image_pull_secret = self._apply_image_pull_secret(
-                registry=f"https://{registry}/v1/",
-                username=envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME,
-                password=envs.GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD,
-            )
+        # NB(thxCode): The image pull secret of the default registry used to be
+        # applied here, but it can only be applied once the namespace to copy
+        # it into is known, which the workload plan only defaults later:
+        # see `_apply_default_image_pull_secret`.
 
         # Prepare mirrored deployment if enabled.
         if self._mutate_create_pod:
@@ -1867,106 +2079,174 @@ class KubernetesDeployer(EndoscopicDeployer):
 
         core_api = kubernetes.client.CoreV1Api(self._client)
 
-        # Preprocess mirrored deployment options.
-        in_same_namespace = (
-            self_pod_namespace == envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
-        )
-        ## - Pod runtime class name
-        mirrored_runtime_class_name: str = self_pod.spec.runtime_class_name or ""
-        ## - Pod image pull secrets
-        mirrored_image_pull_secrets: list[kubernetes.client.V1LocalObjectReference] = (
-            self_pod.spec.image_pull_secrets
-        )
-        if self._image_pull_secret:
-            # Use created image pull secret if exists.
-            mirrored_image_pull_secrets = []
-        ## - Container envs
-        mirrored_envs: list[kubernetes.client.V1EnvVar] = [
-            # Filter out gpustack-internal envs and cross-namespace secret/envref envs.
-            e
-            for e in self_container.env or []
-            if (
-                not e.name.startswith("GPUSTACK_")
-                and (not e.value_from or in_same_namespace)
-            )
-        ]
-        if igs := envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_ENVIRONMENTS:
-            mirrored_envs = [
-                # Filter out ignored envs.
-                e
-                for e in mirrored_envs
-                if e.name not in igs
-            ]
-        ## - Container volume mounts
-        mirrored_volume_mounts: list[kubernetes.client.V1VolumeMount] = (
-            self_container.volume_mounts or []
-        )
-        if igs := envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES:
-            mirrored_volume_mounts = [
-                # Filter out ignored volume mounts.
-                m
-                for m in mirrored_volume_mounts
-                if m.mount_path not in igs
-            ]
-        ## - Container volume devices
-        mirrored_volume_devices: list[kubernetes.client.V1VolumeDevice] = (
-            self_container.volume_devices or []
-        )
-        if igs := envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES:
-            mirrored_volume_devices = [
-                # Filter out ignored volume mounts.
-                d
-                for d in mirrored_volume_devices
-                if d.device_path not in igs
-            ]
-        ## - Pod volumes
-        mirrored_volume_mounts_names = {m.name for m in mirrored_volume_mounts}
-        mirrored_volume_devices_names = {d.name for d in mirrored_volume_devices}
-        mirrored_volumes: list[kubernetes.client.V1Volume] = []
-        # Filter out volumes not used by mirrored volume mounts or devices.
-        for v in self_pod.spec.volumes or []:
-            if (
-                v.name not in mirrored_volume_mounts_names
-                and v.name not in mirrored_volume_devices_names
-            ):
-                continue
-            # Skip downwardAPI/projected volumes
-            if v.downward_api or v.projected:
-                mirrored_volume_mounts_names.discard(v.name)
-                mirrored_volume_devices_names.discard(v.name)
-                continue
-            # Skip configMap/secret/PVC volumes if not in same namespace
-            if (
-                v.config_map or v.secret or v.persistent_volume_claim
-            ) and not in_same_namespace:
-                mirrored_volume_mounts_names.discard(v.name)
-                mirrored_volume_devices_names.discard(v.name)
-                continue
-            # Skip PVCs with RWO or RWOP access modes
-            if v.persistent_volume_claim:
-                pvc = core_api.read_namespaced_persistent_volume_claim(
-                    name=v.persistent_volume_claim.claim_name,
-                    namespace=self_pod_namespace,
-                )
-                if "ReadWriteOncePod" in pvc.spec.access_modes or []:
-                    mirrored_volume_mounts_names.discard(v.name)
-                    mirrored_volume_devices_names.discard(v.name)
-                    continue
-            mirrored_volumes.append(v)
-        ## - Correct Container volume mounts and volume devices without corresponding volumes.
-        mirrored_volume_mounts = [
-            m for m in mirrored_volume_mounts if m.name in mirrored_volume_mounts_names
-        ]
-        mirrored_volume_devices = [
-            d
-            for d in mirrored_volume_devices
-            if d.name in mirrored_volume_devices_names
-        ]
+        # Namespaces already told what they cannot take from the worker,
+        # so redeploying into one does not repeat the same warnings.
+        warned_namespaces: set[WorkloadNamespace] = set()
 
         # Construct mutation function.
         def mutate_create_pod(
             pod: kubernetes.client.V1Pod,
         ) -> kubernetes.client.V1Pod:
+            # Preprocess mirrored deployment options.
+            # NB(thxCode): Resolved per Pod, not once per deployer: a worker
+            # hosts the workloads of several organizations, each in its own
+            # namespace, and Kubernetes resolves a Secret, ConfigMap or PVC
+            # reference in the referring Pod's namespace alone. Deciding once
+            # would settle for every Pod what only holds for the Pods sharing
+            # the namespace of the worker itself, and silently strip the rest.
+            pod_namespace = pod.metadata.namespace or _default_workload_namespace()
+            in_same_namespace = pod_namespace == self_pod_namespace
+            # Report a namespace's dropped options once, on its first Pod.
+            report_drops = pod_namespace not in warned_namespaces
+            warned_namespaces.add(pod_namespace)
+            ## - Pod runtime class name
+            mirrored_runtime_class_name: str = self_pod.spec.runtime_class_name or ""
+            ## - Pod image pull secrets
+            mirrored_image_pull_secrets: list[
+                kubernetes.client.V1LocalObjectReference
+            ] = self_pod.spec.image_pull_secrets or []
+            if pod.spec.image_pull_secrets:
+                # Use created image pull secret if exists.
+                mirrored_image_pull_secrets = []
+            elif mirrored_image_pull_secrets and not in_same_namespace:
+                # A Pod resolves an image pull secret in its own namespace, so
+                # mirroring the worker's names Secrets that do not exist there.
+                if report_drops:
+                    logger.warning(
+                        "Mirrored deployment drops image pull secret(s) %s of self Pod "
+                        "for the workloads of namespace %s: "
+                        "Kubernetes resolves an image pull secret in the referring Pod's namespace, "
+                        "which is not the worker's namespace %s. "
+                        "Configure `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME` "
+                        "and `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD` "
+                        "to have the credentials copied into every workload namespace instead",
+                        ", ".join(
+                            ips.name for ips in mirrored_image_pull_secrets if ips.name
+                        ),
+                        pod_namespace,
+                        self_pod_namespace,
+                    )
+                mirrored_image_pull_secrets = []
+            ## - Container envs
+            mirrored_envs: list[kubernetes.client.V1EnvVar] = [
+                # Filter out gpustack-internal envs and cross-namespace secret/envref envs.
+                e
+                for e in self_container.env or []
+                if (
+                    not e.name.startswith("GPUSTACK_")
+                    and (not e.value_from or in_same_namespace)
+                )
+            ]
+            if not in_same_namespace and report_drops:
+                # Name every env left behind: a customer's HF_TOKEN or proxy
+                # configuration disappearing without a word is indistinguishable
+                # from a workload misbehaving on its own.
+                dropped_env_names = [
+                    e.name
+                    for e in self_container.env or []
+                    if not e.name.startswith("GPUSTACK_") and e.value_from
+                ]
+                if dropped_env_names:
+                    logger.warning(
+                        "Mirrored deployment drops env(s) %s of self Container %s "
+                        "for the workloads of namespace %s: "
+                        "Kubernetes resolves a `valueFrom` reference, a Secret or ConfigMap key among them, "
+                        "in the referring Pod's namespace, which is not the worker's namespace %s. "
+                        "Declare them on the workload itself to have them delivered",
+                        ", ".join(dropped_env_names),
+                        self_container.name,
+                        pod_namespace,
+                        self_pod_namespace,
+                    )
+            igs = envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_ENVIRONMENTS
+            if igs:
+                mirrored_envs = [
+                    # Filter out ignored envs.
+                    e
+                    for e in mirrored_envs
+                    if e.name not in igs
+                ]
+            ## - Container volume mounts
+            mirrored_volume_mounts: list[kubernetes.client.V1VolumeMount] = (
+                self_container.volume_mounts or []
+            )
+            if igs := envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES:
+                mirrored_volume_mounts = [
+                    # Filter out ignored volume mounts.
+                    m
+                    for m in mirrored_volume_mounts
+                    if m.mount_path not in igs
+                ]
+            ## - Container volume devices
+            mirrored_volume_devices: list[kubernetes.client.V1VolumeDevice] = (
+                self_container.volume_devices or []
+            )
+            if igs := envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES:
+                mirrored_volume_devices = [
+                    # Filter out ignored volume mounts.
+                    d
+                    for d in mirrored_volume_devices
+                    if d.device_path not in igs
+                ]
+            ## - Pod volumes
+            mirrored_volume_mounts_names = {m.name for m in mirrored_volume_mounts}
+            mirrored_volume_devices_names = {d.name for d in mirrored_volume_devices}
+            mirrored_volumes: list[kubernetes.client.V1Volume] = []
+            dropped_volume_names: list[str] = []
+            # Filter out volumes not used by mirrored volume mounts or devices.
+            for v in self_pod.spec.volumes or []:
+                if (
+                    v.name not in mirrored_volume_mounts_names
+                    and v.name not in mirrored_volume_devices_names
+                ):
+                    continue
+                # Skip downwardAPI/projected volumes
+                if v.downward_api or v.projected:
+                    mirrored_volume_mounts_names.discard(v.name)
+                    mirrored_volume_devices_names.discard(v.name)
+                    continue
+                # Skip configMap/secret/PVC volumes if not in same namespace
+                if (
+                    v.config_map or v.secret or v.persistent_volume_claim
+                ) and not in_same_namespace:
+                    mirrored_volume_mounts_names.discard(v.name)
+                    mirrored_volume_devices_names.discard(v.name)
+                    dropped_volume_names.append(v.name)
+                    continue
+                # Skip PVCs with RWO or RWOP access modes
+                if v.persistent_volume_claim:
+                    pvc = core_api.read_namespaced_persistent_volume_claim(
+                        name=v.persistent_volume_claim.claim_name,
+                        namespace=self_pod_namespace,
+                    )
+                    if "ReadWriteOncePod" in pvc.spec.access_modes or []:
+                        mirrored_volume_mounts_names.discard(v.name)
+                        mirrored_volume_devices_names.discard(v.name)
+                        continue
+                mirrored_volumes.append(v)
+            if dropped_volume_names and report_drops:
+                logger.warning(
+                    "Mirrored deployment drops volume(s) %s of self Pod "
+                    "for the workloads of namespace %s: "
+                    "Kubernetes resolves a ConfigMap, Secret or PersistentVolumeClaim "
+                    "in the referring Pod's namespace, "
+                    "which is not the worker's namespace %s",
+                    ", ".join(dropped_volume_names),
+                    pod_namespace,
+                    self_pod_namespace,
+                )
+            ## - Correct Container volume mounts and volume devices without corresponding volumes.
+            mirrored_volume_mounts = [
+                m
+                for m in mirrored_volume_mounts
+                if m.name in mirrored_volume_mounts_names
+            ]
+            mirrored_volume_devices = [
+                d
+                for d in mirrored_volume_devices
+                if d.name in mirrored_volume_devices_names
+            ]
+
             if mirrored_runtime_class_name and not pod.spec.runtime_class_name:
                 pod.spec.runtime_class_name = mirrored_runtime_class_name
 
@@ -2140,6 +2420,141 @@ class KubernetesDeployer(EndoscopicDeployer):
             ephemeral_filename_mapping,
         )
 
+    def _workload_namespace(
+        self,
+        namespace: WorkloadNamespace | None = None,
+        name: WorkloadName | None = None,
+    ) -> WorkloadNamespace:
+        """
+        Resolve the namespace a workload lives in.
+
+        Args:
+            namespace:
+                The namespace the caller declared, if any.
+            name:
+                The name of the workload, which lets a caller declaring no
+                namespace search the workload namespaces for it.
+
+        Returns:
+            The namespace holding the workload: the declared one, the one the
+            search finds it in, or the configured default.
+
+        """
+        if namespace:
+            return namespace
+        if name:
+            found = self._search_workload_namespace(name)
+            if found:
+                return found
+        return _default_workload_namespace()
+
+    def _search_workload_namespace(
+        self,
+        name: WorkloadName,
+    ) -> WorkloadNamespace | None:
+        """
+        Search the workload namespaces for the one holding the given workload,
+        which is what an operation carrying a name only has to do: the
+        namespace belongs to the workload, so the name alone cannot tell it.
+
+        Args:
+            name:
+                The name of the workload.
+
+        Returns:
+            The namespace holding the workload, None if the search finds none
+            or cannot be made at all.
+
+        """
+        try:
+            k_pods = self._list_workload_pods(
+                label_selector=f"{_LABEL_WORKLOAD}={name}",
+                resource_version=_get_quorum_read_resource_version(),
+            )
+        except kubernetes.client.exceptions.ApiException:
+            # The search only narrows a namespace the caller left open, so a
+            # failed one degrades to the configured default rather than
+            # failing the operation asking for it.
+            debug_log_exception(
+                logger,
+                "Failed to search the namespace of workload %s",
+                name,
+            )
+            return None
+
+        namespaces = sorted({k_pod.metadata.namespace for k_pod in k_pods})
+        if not namespaces:
+            return None
+        if len(namespaces) > 1:
+            # Two organizations may name a workload alike, so pick
+            # deterministically and say which one was picked.
+            logger.warning(
+                "Workload %s found in multiple namespaces %s, using %s",
+                name,
+                namespaces,
+                namespaces[0],
+            )
+        return namespaces[0]
+
+    def _list_workload_pods(
+        self,
+        namespace: WorkloadNamespace | None = None,
+        **list_options,
+    ) -> list[kubernetes.client.V1Pod]:
+        """
+        List the workload Pods matching the given options.
+
+        A caller declaring a namespace reads that namespace only, which is the
+        single read it has always been. A caller declaring none cannot know
+        which organization namespace holds the workload, so it reads every
+        namespace at once and keeps the Pods of the workload namespaces; a
+        cluster not letting the deployer read Pods cluster-wide degrades to the
+        configured default namespace, the only namespace it used to read.
+
+        Args:
+            namespace:
+                The namespace to read, every workload namespace if None.
+            **list_options:
+                Options to pass to the list call, e.g. the label selector.
+
+        Returns:
+            The Pods found.
+
+        Raises:
+            kubernetes.client.exceptions.ApiException:
+                If the Pods fail to list.
+
+        """
+        core_api = kubernetes.client.CoreV1Api(self._client)
+
+        if namespace:
+            k_pods = core_api.list_namespaced_pod(
+                namespace=namespace,
+                **list_options,
+            )
+            return k_pods.items or []
+
+        try:
+            k_pods = core_api.list_pod_for_all_namespaces(**list_options)
+        except kubernetes.client.exceptions.ApiException:
+            fallback_namespace = _default_workload_namespace()
+            debug_log_exception(
+                logger,
+                "Failed to list pods across namespaces, falling back to namespace %s",
+                fallback_namespace,
+            )
+            k_pods = core_api.list_namespaced_pod(
+                namespace=fallback_namespace,
+                **list_options,
+            )
+            return k_pods.items or []
+
+        return [
+            k_pod
+            for k_pod in k_pods.items or []
+            if _is_workload_namespace(k_pod.metadata.namespace)
+        ]
+
     @_supported
     def _get(
         self,
@@ -2165,8 +2580,6 @@ class KubernetesDeployer(EndoscopicDeployer):
                 If the Kubernetes workload fails to get.
 
         """
-        namespace = namespace or envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
-
         list_options = {
             "label_selector": f"{_LABEL_WORKLOAD}={name}",
             "resource_version": _get_quorum_read_resource_version(),
@@ -2175,7 +2588,10 @@ class KubernetesDeployer(EndoscopicDeployer):
         core_api = kubernetes.client.CoreV1Api(self._client)
 
         try:
-            k_pods = core_api.list_namespaced_pod(
+            # A caller declaring no namespace reads the workload namespaces,
+            # so it finds the workload wherever the organization owning it
+            # deploys instead of in the deployer's own namespace only.
+            k_pods = self._list_workload_pods(
                 namespace=namespace,
                 **list_options,
             )
@@ -2183,9 +2599,9 @@ class KubernetesDeployer(EndoscopicDeployer):
             msg = f"Failed to get deployment of workload {name}{_detail_api_call_error(e)}"
             raise OperationError(msg) from e
 
-        if len(k_pods.items) > 1:
+        if len(k_pods) > 1:
             namespaced_names = [
-                f"{d.metadata.namespace}/{d.metadata.name}" for d in k_pods.items
+                f"{d.metadata.namespace}/{d.metadata.name}" for d in k_pods
             ]
             logger.warning(
                 "Multiple pods found for workload %s: %s",
@@ -2193,10 +2609,10 @@ class KubernetesDeployer(EndoscopicDeployer):
                 namespaced_names,
             )
 
-        if not k_pods.items:
+        if not k_pods:
             return None
 
-        k_pod = k_pods.items[0]
+        k_pod = k_pods[0]
         return KubernetesWorkloadStatus(
             name=name,
             k_pod=k_pod,
@@ -2232,12 +2648,21 @@ class KubernetesDeployer(EndoscopicDeployer):
                 If the Kubernetes workload fails to delete.
 
         """
-        namespace = namespace or envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
-
         # Check if the workload exists.
         workload = self.get(name=name, namespace=namespace)
         if not workload:
             return None
+
+        # Delete from the namespace holding the workload, which the lookup
+        # above reports: deleting from the deployer's own namespace instead
+        # leaves the Pod running, and with it the devices it holds. The lookup
+        # has already searched the workload namespaces, so there is nothing
+        # left to resolve beyond the fallback every operation shares.
+        namespace = (
+            getattr(workload, "namespace", None)
+            or namespace
+            or _default_workload_namespace()
+        )
 
         resource_version = _get_quorum_read_resource_version()
         label_selector = f"{_LABEL_WORKLOAD}={name}"
@@ -2372,8 +2797,6 @@ class KubernetesDeployer(EndoscopicDeployer):
                 If the Kubernetes workloads fail to list.
 
         """
-        namespace = namespace or envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
-
         list_options = {
             "label_selector": ",".join(
                 [
@@ -2391,7 +2814,10 @@ class KubernetesDeployer(EndoscopicDeployer):
         core_api = kubernetes.client.CoreV1Api(self._client)
 
         try:
-            k_pods = core_api.list_namespaced_pod(
+            # A caller declaring no namespace sweeps the workload namespaces:
+            # a worker hosts the workloads of several organizations, so the
+            # deployer's own namespace lists none of them.
+            k_pods = self._list_workload_pods(
                 namespace=namespace,
                 **list_options,
             )
@@ -2405,7 +2831,7 @@ class KubernetesDeployer(EndoscopicDeployer):
                 k_pod=k_pod,
                 core_api=core_api,
             )
-            for k_pod in k_pods.items or []
+            for k_pod in k_pods
             if (
                 k_pod.metadata.labels
                 and _LABEL_WORKLOAD in k_pod.metadata.labels
@@ -2453,8 +2879,9 @@ class KubernetesDeployer(EndoscopicDeployer):
                 If the Kubernetes workload logs fail to retrieve.
 
         """
-        namespace = namespace or envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
-
+        # The namespace is resolved by the lookup, which searches the workload
+        # namespaces when the caller declares none, and the Pod it finds
+        # carries the namespace the log read below needs.
         workload = self.get(name=name, namespace=namespace)
         if not workload:
             msg = f"Workload {name} not found"
@@ -2536,8 +2963,9 @@ class KubernetesDeployer(EndoscopicDeployer):
                 If the Kubernetes workload exec fails.
 
         """
-        namespace = namespace or envs.GPUSTACK_RUNTIME_KUBERNETES_NAMESPACE
-
+        # The namespace is resolved by the lookup, which searches the workload
+        # namespaces when the caller declares none, and the Pod it finds
+        # carries the namespace the exec below needs.
         workload = self.get(name=name, namespace=namespace)
         if not workload:
             msg = f"Workload {name} not found"
@@ -3005,6 +3433,140 @@ def equal_containers(
     return all(not (k not in benv or benv[k] != v) for k, v in aenv.items())
 
 
+_MANAGED_POD_LABELS = frozenset(
+    {
+        _LABEL_WORKLOAD,
+        _LABEL_KUEUE_QUEUE_NAME,
+        _LABEL_KUEUE_POD_GROUP_NAME,
+    },
+)
+"""
+Labels this deployer declares on a Pod and therefore compares.
+"""
+
+_MANAGED_POD_ANNOTATIONS = frozenset(
+    {
+        _ANNOTATION_KUEUE_POD_GROUP_TOTAL_COUNT,
+        _ANNOTATION_PREFERRED_DEVICE_INDEX,
+    },
+)
+"""
+Annotations this deployer declares on a Pod and therefore compares.
+"""
+
+_MANAGED_POD_METADATA_PREFIXES = (f"{envs.GPUSTACK_RUNTIME_DEPLOY_LABEL_PREFIX}/",)
+"""
+Prefixes of the label and annotation keys this deployer owns outright, e.g. the
+per-container name annotations, whose exact keys depend on the workload.
+"""
+
+_FOREIGN_MANAGED_POD_METADATA_PREFIXES = ("kueue.x-k8s.io/",)
+"""
+Prefixes of the managed keys another controller also writes, which are
+therefore compared one way only, see `_equal_managed_metadata`.
+"""
+
+
+def _managed_metadata(
+    entries: dict[str, str] | None,
+    managed_keys: frozenset[str],
+) -> dict[str, str]:
+    """
+    Return the entries of the given labels or annotations this deployer
+    declares, which are the ones it may have to change.
+
+    Comparing the whole metadata instead would churn on every reconcile: the
+    API server, the admission webhooks and the controllers taking over the Pod
+    all stamp their own annotations on it, e.g. the CNI's or Kueue's, and none
+    of those says anything about the workload being deployed.
+
+    Args:
+        entries:
+            The labels or annotations to filter.
+        managed_keys:
+            The exact keys this deployer declares.
+
+    Returns:
+        The managed entries.
+
+    """
+    return {
+        k: v
+        for k, v in (entries or {}).items()
+        if k in managed_keys or k.startswith(_MANAGED_POD_METADATA_PREFIXES)
+    }
+
+
+def _equal_managed_metadata(
+    actual: dict[str, str] | None,
+    desired: dict[str, str] | None,
+    managed_keys: frozenset[str],
+) -> bool:
+    """
+    Compare the managed entries of two label or annotation sets.
+
+    The keys this deployer owns outright compare both ways: nothing else
+    writes them, so a difference in either direction is one this deployer
+    made, e.g. renaming a container.
+
+    The managed keys another controller also writes -- the Kueue ones, which
+    an admission webhook may default or add -- compare one way only: the
+    desired value must be there, and an entry only the actual Pod carries is
+    left alone. Comparing those both ways would have the deployer recreate a
+    Pod on every reconcile as soon as the webhook adds one of them.
+
+    Args:
+        actual:
+            The labels or annotations of the actual Pod.
+        desired:
+            The labels or annotations of the desired Pod.
+        managed_keys:
+            The exact keys this deployer declares.
+
+    Returns:
+        True if the managed entries are equal, False otherwise.
+
+    """
+    actual_managed = _managed_metadata(actual, managed_keys)
+    desired_managed = _managed_metadata(desired, managed_keys)
+
+    for k, v in desired_managed.items():
+        if actual_managed.get(k) != v:
+            return False
+
+    return all(
+        k in desired_managed
+        for k in actual_managed
+        if not k.startswith(_FOREIGN_MANAGED_POD_METADATA_PREFIXES)
+    )
+
+
+def _equal_pod_node_selectors(
+    actual: kubernetes.client.V1PodSpec,
+    desired: kubernetes.client.V1PodSpec,
+) -> bool:
+    """
+    Compare the node selectors of two Pod specs, one way only: every selector
+    the desired spec declares must be there, and a selector only the actual Pod
+    carries is left alone, as admission adds its own -- Kueue copies the node
+    labels of the ResourceFlavor it admitted the workload on into the Pod.
+
+    Args:
+        actual:
+            The spec of the actual Pod.
+        desired:
+            The spec of the desired Pod.
+
+    Returns:
+        True if the actual Pod carries the declared selectors, False otherwise.
+
+    """
+    actual_selector = actual.node_selector or {}
+    return all(
+        actual_selector.get(k) == v for k, v in (desired.node_selector or {}).items()
+    )
+
+
 def _pod_termination_grace_period_seconds(
     spec: kubernetes.client.V1PodSpec,
 ) -> int:
@@ -3023,20 +3585,39 @@ def equal_pods(
     b: kubernetes.client.V1Pod,
 ) -> bool:
     """
-    Compare two Kubernetes Pod specs for equality, ignoring certain fields.
+    Compare two Kubernetes Pods for equality, ignoring certain fields.
 
     Args:
         a:
-            The first Pod spec.
+            The actual Pod, i.e. the one the cluster holds.
         b:
-            The second Pod spec.
+            The desired Pod, i.e. the one this deployer declares.
 
     Returns:
-        True if the Pod specs are equal, False otherwise.
+        True if the Pods are equal, False otherwise.
 
     """
+    # The metadata this deployer declares decides as much as the spec does: the
+    # gang markers admitting a workload as a whole live in the labels and the
+    # annotations, so a Pod matching on the spec alone would keep running
+    # ungrouped, and changing the size of a group would never reach it.
+    if not _equal_managed_metadata(
+        a.metadata.labels if a.metadata else None,
+        b.metadata.labels if b.metadata else None,
+        _MANAGED_POD_LABELS,
+    ):
+        return False
+    if not _equal_managed_metadata(
+        a.metadata.annotations if a.metadata else None,
+        b.metadata.annotations if b.metadata else None,
+        _MANAGED_POD_ANNOTATIONS,
+    ):
+        return False
+
     aspec = a.spec
     bspec = b.spec
+    if not _equal_pod_node_selectors(aspec, bspec):
+        return False
     if len(aspec.init_containers or []) != len(bspec.init_containers or []):
         return False
     for ac, bc in zip(
@@ -3081,8 +3662,22 @@ def equal_pods(
     return True
 
 
+_WATCH_TIMEOUT_SECONDS = 300
+"""
+Duration in seconds a watch streams events for at most, after which the API
+server closes it and the loop reading it ends.
+Generous enough for a Pod to drain within the grace periods a workload
+declares, which is what the watches here wait for.
+"""
+
+
 @contextlib.contextmanager
 def watch(func, *args, **kwargs):
+    # Bound every watch: an unbounded one turns a dropped connection or an
+    # event that never comes into an operation waiting forever, and the loop
+    # reading the stream only ends when the stream does.
+    kwargs.setdefault("timeout_seconds", _WATCH_TIMEOUT_SECONDS)
+
     w: kubernetes.watch.Watch | None = None
     try:
         w = kubernetes.watch.Watch()
