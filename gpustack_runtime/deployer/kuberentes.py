@@ -73,6 +73,21 @@ _ANNOTATION_KUEUE_POD_GROUP_TOTAL_COUNT = "kueue.x-k8s.io/pod-group-total-count"
 Annotation carrying how many Pods the Kueue Pod group counts,
 which Kueue waits for before admitting the gang.
 """
+ANNOTATION_KUEUE_RETRIABLE_IN_GROUP = "kueue.x-k8s.io/retriable-in-group"
+"""
+Annotation telling Kueue a member of an admitted Pod group is gone for good,
+rather than waiting to be replaced.
+
+Public on purpose, as the caller deleting a group's member is the one who
+knows the group is over.
+
+Deleting such a member without stamping it "false" first leaves Kueue holding
+the group together: the Workload keeps its quota reserved for the replacement
+it expects, and the Pod stays in Terminating, because nobody removes the
+`kueue.x-k8s.io/managed` finalizer of a member Kueue still counts. The devices
+of the whole group stay booked, for a group that is never coming back. So this
+is not a nicety of the teardown path -- it *is* how the quota is released.
+"""
 _ANNOTATION_PREFERRED_DEVICE_INDEX = "device.gpustack.ai/accelerator.preferred-index"
 """
 Annotation selecting the devices the GPUStack device plugin allocates.
@@ -581,6 +596,60 @@ _NAME = "kubernetes"
 """
 Name of the Kubernetes deployer.
 """
+
+
+def _patch_pod_annotations(
+    core_api: kubernetes.client.CoreV1Api,
+    k_pod: kubernetes.client.V1Pod,
+    annotations: dict[str, str],
+    workload_name: WorkloadName,
+) -> bool:
+    """
+    Stamp the given annotations onto one Pod.
+
+    Args:
+        core_api:
+            The Kubernetes core API to patch through.
+        k_pod:
+            The Pod to annotate.
+        annotations:
+            The annotations to stamp, merged into the ones the Pod already
+            carries.
+        workload_name:
+            The name of the workload the Pod belongs to, for reporting only.
+
+    Returns:
+        True if the Pod has been annotated, False if it is already gone.
+
+    Raises:
+        OperationError:
+            If the Pod fails to annotate.
+
+    """
+    try:
+        # A strategic merge patch of the metadata only: the Pod is about to be
+        # deleted, so everything else about it -- including the annotations
+        # another controller owns -- is left exactly as it is.
+        core_api.patch_namespaced_pod(
+            name=k_pod.metadata.name,
+            namespace=k_pod.metadata.namespace,
+            body={"metadata": {"annotations": annotations}},
+        )
+    except kubernetes.client.exceptions.ApiException as e:
+        if e.status == 404:
+            # A Pod deleted between the lookup and the patch needs no
+            # annotation, the same way a workload already gone does not.
+            return False
+        msg = f"Failed to annotate pod of workload {workload_name}{_detail_api_call_error(e)}"
+        raise OperationError(msg) from e
+    # Annotating a workload always fails with an OperationError, mirroring the
+    # deletion it precedes, so the transport errors underneath the API errors
+    # do not escape either.
+    except Exception as e:
+        msg = f"Failed to annotate pod of workload {workload_name}{_detail_api_call_error(e)}"
+        raise OperationError(msg) from e
+
+    return True
 
 
 def _apply_instance_type_admission(
@@ -2618,6 +2687,64 @@ class KubernetesDeployer(EndoscopicDeployer):
             k_pod=k_pod,
             core_api=core_api,
         )
+
+    @_supported
+    def _annotate(
+        self,
+        name: WorkloadName,
+        namespace: WorkloadNamespace | None = None,
+        annotations: dict[str, str] | None = None,
+    ) -> bool:
+        """
+        Stamp the given annotations onto the Pods of a Kubernetes workload.
+
+        The Pods only: the annotations address a controller watching the Pods,
+        e.g. Kueue, and the Services and ConfigMaps of a workload are watched
+        by nobody.
+
+        Args:
+            name:
+                The name of the workload.
+            namespace:
+                The namespace of the workload.
+            annotations:
+                The annotations to stamp, merged into the ones the Pods
+                already carry.
+
+        Returns:
+            True if any Pod has been annotated,
+            False if the workload has no Pods left, which is not an error:
+            a workload already gone is a workload needing no annotation.
+
+        Raises:
+            UnsupportedError:
+                If Kubernetes is not supported in the current environment.
+            OperationError:
+                If the Kubernetes workload fails to annotate.
+
+        """
+        if not annotations:
+            return False
+
+        try:
+            # A caller declaring no namespace reads the workload namespaces,
+            # the same lookup every operation carrying a name only does.
+            k_pods = self._list_workload_pods(
+                namespace=namespace,
+                label_selector=f"{_LABEL_WORKLOAD}={name}",
+                resource_version=_get_quorum_read_resource_version(),
+            )
+        except kubernetes.client.exceptions.ApiException as e:
+            msg = f"Failed to get deployment of workload {name}{_detail_api_call_error(e)}"
+            raise OperationError(msg) from e
+
+        core_api = kubernetes.client.CoreV1Api(self._client)
+
+        annotated = False
+        for k_pod in k_pods:
+            annotated |= _patch_pod_annotations(core_api, k_pod, annotations, name)
+
+        return annotated
 
     @_supported
     def _delete(

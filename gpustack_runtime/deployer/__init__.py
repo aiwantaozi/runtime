@@ -37,6 +37,7 @@ from .docker import (
     DockerWorkloadStatus,
 )
 from .kuberentes import (
+    ANNOTATION_KUEUE_RETRIABLE_IN_GROUP,
     KubernetesDeployer,
     KubernetesWorkloadPlan,
     KubernetesWorkloadStatus,
@@ -151,6 +152,7 @@ def delete_workload(
     name: WorkloadName,
     namespace: WorkloadNamespace | None = None,
     grace_period_seconds: int | None = None,
+    annotations: dict[str, str] | None = None,
 ) -> WorkloadStatus | None:
     """
     Delete the given workload.
@@ -163,6 +165,17 @@ def delete_workload(
         grace_period_seconds:
             Duration in seconds the workload needs to terminate gracefully,
             which overrides the one declared by the workload plan.
+        annotations:
+            The annotations to stamp onto the workload before deleting it,
+            which tell the controllers watching it what the deletion means,
+            e.g. `{ANNOTATION_KUEUE_RETRIABLE_IN_GROUP: "false"}` tells Kueue
+            the Pod group is over and its quota is to be released -- without
+            it, the quota stays booked and the Pod stays in Terminating.
+            Deployers without a concept of annotations log and ignore them,
+            as no controller is watching there in the first place.
+            Stamping them is best-effort: a failure to annotate is logged and
+            the deletion carries on, as a workload left running holds devices,
+            which is the worse of the two failures.
 
     Return:
         The status if found, None otherwise.
@@ -184,6 +197,7 @@ def delete_workload(
             name=name,
             namespace=namespace,
             grace_period_seconds=grace_period_seconds,
+            annotations=annotations,
         )
 
     raise UnsupportedError(_NO_AVAILABLE_DEPLOYER_MSG)
@@ -576,6 +590,7 @@ def inspect_self() -> str:
 
 
 __all__ = [
+    "ANNOTATION_KUEUE_RETRIABLE_IN_GROUP",
     "Container",
     "ContainerCapabilities",
     "ContainerCheck",

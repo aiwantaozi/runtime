@@ -3,6 +3,7 @@ from __future__ import annotations as __future_annotations__
 import asyncio
 import atexit
 import contextlib
+import logging
 import re
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,8 @@ from .k8s.devicemanager import cdi_kind_to_kdp_resource
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Generator
+
+logger = logging.getLogger(__name__)
 
 _RE_LABEL_VALUE = re.compile(r"^(?!-)[A-Za-z0-9_.-]{0,63}(?<!-)$")
 """
@@ -2196,12 +2199,108 @@ class Deployer(ABC):
         raise NotImplementedError
 
     @_default_args
+    def annotate(
+        self,
+        name: WorkloadName,
+        namespace: WorkloadNamespace | None = None,
+        *,
+        annotations: dict[str, str] | None = None,
+        async_mode: bool | None = None,
+    ) -> bool:
+        """
+        Stamp the given annotations onto a deployed workload.
+
+        Args:
+            name:
+                The name of the workload.
+            namespace:
+                The namespace of the workload.
+            annotations:
+                The annotations to stamp, merged into the ones the workload
+                already carries.
+            async_mode:
+                Whether to execute in a separate thread.
+
+        Returns:
+            True if the annotations have been stamped,
+            False if the deployer has no concept of annotations,
+            or the workload is gone.
+
+        Raises:
+            UnsupportedError:
+                If the deployer is not supported in the current environment.
+            OperationError:
+                If the workload fails to annotate.
+
+        """
+        if not annotations:
+            return False
+
+        if async_mode:
+            try:
+                future = self.pool.submit(
+                    self._annotate,
+                    name,
+                    namespace,
+                    annotations,
+                )
+                return future.result()
+            except OperationError:
+                raise
+            except Exception as e:
+                msg = "Asynchronous workload annotate failed."
+                raise OperationError(msg) from e
+        else:
+            return self._annotate(name, namespace, annotations)
+
+    def _annotate(
+        self,
+        name: WorkloadName,
+        namespace: WorkloadNamespace | None = None,
+        annotations: dict[str, str] | None = None,
+    ) -> bool:
+        """
+        Stamp the given annotations onto a deployed workload.
+
+        Not abstract, and a no-op by default: annotations address a controller
+        watching the deployed objects, which only the Kubernetes deployer has.
+        A deployer without one says so -- by returning False and saying it out
+        loud -- rather than pretending the caller's request has been honored.
+
+        Args:
+            name:
+                The name of the workload.
+            namespace:
+                The namespace of the workload.
+            annotations:
+                The annotations to stamp.
+
+        Returns:
+            True if the annotations have been stamped, False otherwise.
+
+        Raises:
+            UnsupportedError:
+                If the deployer is not supported in the current environment.
+            OperationError:
+                If the workload fails to annotate.
+
+        """
+        logger.warning(
+            "Deployer %s cannot annotate workload %s, ignoring annotations %s",
+            self.name,
+            name,
+            sorted(annotations or {}),
+        )
+        return False
+
+    @_default_args
     def delete(
         self,
         name: WorkloadName,
         namespace: WorkloadNamespace | None = None,
         *,
         grace_period_seconds: int | None = None,
+        annotations: dict[str, str] | None = None,
         async_mode: bool | None = None,
     ) -> WorkloadStatus | None:
         """
@@ -2215,6 +2314,10 @@ class Deployer(ABC):
             grace_period_seconds:
                 Duration in seconds the workload needs to terminate gracefully,
                 which overrides the one declared by the workload plan.
+            annotations:
+                The annotations to stamp onto the workload before deleting it,
+                e.g. the one telling Kueue the Pod group is over,
+                see `ANNOTATION_KUEUE_RETRIABLE_IN_GROUP`.
             async_mode:
                 Whether to execute in a separate thread.
 
@@ -2233,6 +2336,32 @@ class Deployer(ABC):
         if grace_period_seconds is not None and grace_period_seconds < 0:
             msg = "Workload termination grace period must not be negative."
             raise ValueError(msg)
+
+        if annotations:
+            # Before the deletion, never after: the annotations are read by the
+            # controller reacting to the deletion, so one stamped afterwards --
+            # if it can be stamped at all, the object being gone -- arrives
+            # after the decision it was meant to inform.
+            try:
+                self.annotate(
+                    name=name,
+                    namespace=namespace,
+                    annotations=annotations,
+                    async_mode=async_mode,
+                )
+            # Annotating is best-effort, and deliberately so: a workload that
+            # fails to annotate but still goes away leaves a controller
+            # mis-informed, while one that is not deleted keeps holding the
+            # devices it was deployed with. The louder failure is the one that
+            # keeps the cards, so the annotation is logged and the deletion
+            # carries on.
+            except Exception:
+                logger.warning(
+                    "Failed to annotate workload %s before deleting it, "
+                    "deleting it anyway",
+                    name,
+                    exc_info=envs.GPUSTACK_RUNTIME_LOG_EXCEPTION,
+                )
 
         if async_mode:
             try:
