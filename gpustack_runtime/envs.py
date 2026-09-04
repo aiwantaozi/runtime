@@ -55,6 +55,12 @@ if TYPE_CHECKING:
     e.g `{"cuda": "nvidia.com/devices", "rocm": "amd.com/devices"}`.
     Used to map the gpustack-runner's backend name to the corresponding resource key.
     """
+    GPUSTACK_RUNTIME_DETECT_LLDP_LISTEN_SECONDS: float = 35.0
+    """
+    How long `detect_lldp_neighbors` listens for switch advertisements.
+    Switches announce every 30s by default; a switch configured with a longer
+    interval needs a longer listen or its ports go unreported.
+    """
     ## Deployer
     GPUSTACK_RUNTIME_DEPLOY: str | None = None
     """
@@ -391,6 +397,12 @@ variables: dict[str, Callable[[], Any]] = {
         getenv(
             "GPUSTACK_RUNTIME_DETECT_NO_HEALTH_CHECK",
             "1",
+        ),
+    ),
+    "GPUSTACK_RUNTIME_DETECT_LLDP_LISTEN_SECONDS": lambda: to_float(
+        getenv(
+            "GPUSTACK_RUNTIME_DETECT_LLDP_LISTEN_SECONDS",
+            "35",
         ),
     ),
     "GPUSTACK_RUNTIME_DETECT_BACKEND_MAP_RESOURCE_KEY": lambda: to_dict(

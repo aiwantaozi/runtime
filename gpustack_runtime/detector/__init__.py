@@ -21,6 +21,7 @@ from .ascend import AscendDetector
 from .cambricon import CambriconDetector
 from .hygon import HygonDetector
 from .iluvatar import IluvatarDetector
+from .lldp import LLDPNeighbor, detect_lldp_neighbors
 from .metax import MetaXDetector
 from .mthreads import MThreadsDetector
 from .nvidia import NVIDIADetector
@@ -336,6 +337,7 @@ __all__ = [
     "Device",
     "DeviceMemoryStatusEnum",
     "Devices",
+    "LLDPNeighbor",
     "ManufacturerEnum",
     "Topology",
     "available_backends",
@@ -343,6 +345,7 @@ __all__ = [
     "backend_to_manufacturer",
     "detect_backend",
     "detect_devices",
+    "detect_lldp_neighbors",
     "expand_mig_devices",
     "filter_devices_by_manufacturer",
     "get_devices_topologies",
