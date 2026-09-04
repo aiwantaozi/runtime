@@ -22,6 +22,7 @@ from .__types__ import (
 )
 from .__utils__ import (
     PCIDevice,
+    execute_command,
     get_brief_version,
     get_numa_node_by_bdf,
     get_pci_devices,
@@ -232,6 +233,22 @@ class AscendDetector(Detector):
                         dev_appendix["roce_mask"] = str(dev_roce_mask)
                     if dev_roce_gateway:
                         dev_appendix["roce_gateway"] = str(dev_roce_gateway)
+
+                    # Where this NPU sits beyond the host: the super pod it
+                    # is a member of, and the switch its RoCE port is
+                    # plugged into. Both are static, so they belong to the
+                    # information pass and not the usage one.
+                    dev_super_pod = _get_device_super_pod_info(
+                        dev_card_id,
+                        dev_device_id,
+                        dev_appendix["arch_family"],
+                    )
+                    if dev_super_pod:
+                        dev_appendix.update(dev_super_pod)
+                    if dev_roce_ip:
+                        dev_lldp = _get_device_roce_lldp_neighbor(dev_physical_id)
+                        if dev_lldp:
+                            dev_appendix.update(dev_lldp)
 
                     ret.append(
                         Device(
@@ -1024,6 +1041,135 @@ def _get_device_roce_network_info(
         debug_log_exception(logger, "Failed to get device RoCE network info")
 
     return ip, mask, gateway
+
+
+# The CANN variants whose NPUs can be super pod members. The query is not sent
+# to earlier generations: it is reached through the generic
+# ``dcmi_get_device_info`` and a driver that does not know the sub command may
+# answer with zeroed fields rather than an error, and a super pod id of 0 on
+# every A2 in a fleet would read as one shared domain.
+_SUPER_POD_CANN_VARIANTS = frozenset({"a3", "950"})
+
+
+def _get_device_super_pod_info(
+    dev_card_id,
+    dev_device_id,
+    dev_arch_family: str | None,
+) -> dict | None:
+    """
+    Get the super pod an NPU belongs to.
+
+    Args:
+        dev_card_id:
+            The DCMI card id.
+        dev_device_id:
+            The DCMI device id within the card.
+        dev_arch_family:
+            The SoC name guessed from the device name, used to skip generations
+            that have no super pod.
+
+    Returns:
+        A dict with ``super_pod_id``, ``super_pod_server_id``, ``super_pod_sdid``
+        and ``super_pod_scale_type``, or None when the device is not in a super
+        pod.
+
+    """
+    if get_ascend_cann_variant(dev_arch_family) not in _SUPER_POD_CANN_VARIANTS:
+        return None
+
+    try:
+        info = pydcmi.dcmi_get_device_spod_info(dev_card_id, dev_device_id)
+    except pydcmi.DCMIError:
+        debug_log_warning(logger, "Failed to get device super pod info")
+        return None
+
+    return {
+        "super_pod_id": int(info.super_pod_id),
+        "super_pod_server_id": int(info.server_id),
+        "super_pod_sdid": int(info.sdid),
+        "super_pod_scale_type": int(info.scale_type),
+    }
+
+
+_HCCN_TOOL = "hccn_tool"
+
+# ``hccn_tool -lldp -g`` prints one TLV per block: a title line ending in
+# ``TLV`` followed by indented ``Key: value`` lines. Only the identity TLVs are
+# kept; the rest (TTL, VLAN, MAU type ...) says nothing about where the port is.
+_HCCN_LLDP_TLVS = {
+    "Chassis ID TLV": "roce_lldp_chassis_id",
+    "Port ID TLV": "roce_lldp_port_id",
+    "Port Description TLV": "roce_lldp_port_description",
+    "System Name TLV": "roce_lldp_system_name",
+}
+
+
+def _get_device_roce_lldp_neighbor(dev_physical_id: int) -> dict | None:
+    """
+    Get the LLDP neighbor of an NPU's RoCE port: the switch it is cabled to.
+
+    Two NPUs whose ports report the same chassis id hang off the same leaf
+    switch, which is the closest thing to a rack a host can learn on its own.
+    The port speaks LLDP from the NIC firmware, so this needs neither a host
+    daemon nor any privilege beyond running ``hccn_tool``.
+
+    Args:
+        dev_physical_id:
+            The physical NPU id, which is what ``hccn_tool -i`` addresses.
+
+    Returns:
+        A dict with ``roce_lldp_chassis_id``, ``roce_lldp_port_id``,
+        ``roce_lldp_port_description`` and ``roce_lldp_system_name`` (those
+        present), or None when the port has no neighbor or the tool is absent.
+
+    """
+    try:
+        output = execute_command(
+            [_HCCN_TOOL, "-i", str(dev_physical_id), "-lldp", "-g"],
+        )
+    except (RuntimeError, ValueError):
+        debug_log_warning(
+            logger,
+            "Failed to get RoCE LLDP neighbor of device %d",
+            dev_physical_id,
+        )
+        return None
+
+    return parse_hccn_lldp(output) or None
+
+
+def parse_hccn_lldp(output: str | None) -> dict:
+    """
+    Parse the identity TLVs out of ``hccn_tool -lldp -g`` output.
+
+    Args:
+        output:
+            The tool's stdout.
+
+    Returns:
+        A dict keyed like ``_HCCN_LLDP_TLVS`` values; empty when nothing parsed.
+
+    """
+    ret: dict[str, str] = {}
+    if not output:
+        return ret
+
+    key: str | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.endswith("TLV"):
+            key = _HCCN_LLDP_TLVS.get(line)
+            continue
+        if key is None or key in ret:
+            continue
+        # The value line reads ``MAC: c0:f9:...`` or ``Ifname: 200GE1/0/9``;
+        # the subtype prefix is dropped, the chassis id keeps its bytes as
+        # the switch prints them.
+        _, sep, value = line.partition(": ")
+        ret[key] = value.strip() if sep else line
+    return ret
 
 
 def _get_toolkit_home() -> Path:

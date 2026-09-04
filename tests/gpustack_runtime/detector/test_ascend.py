@@ -198,6 +198,9 @@ class _FakeDCMI:
     # Memory, in MiB, per generation of the memory calls.
     hbm_size: int = 65536
     hbm_usage: int = 1024
+    # (super_pod_id, server_id, sdid, scale_type) the CHIP_INF query answers
+    # with, or None to answer as a driver outside any super pod does.
+    super_pod: tuple[int, int, int, int] | None = None
     v3_size: int = 32768
     v3_available: int = 24576
     v2_size: int = 16384
@@ -229,6 +232,8 @@ class _FakeDCMI:
             "dcmi_get_device_bdf": self._get_device_bdf,
             "dcmi_get_device_pcie_info": self._get_device_pcie_info,
             "dcmi_get_device_ip": self._get_device_ip,
+            "dcmi_get_device_gateway": self._get_device_gateway,
+            "dcmi_get_device_spod_info": self._get_device_spod_info,
             "dcmi_get_affinity_cpu_info_by_device_id": self._get_affinity_cpu_info,
             "dcmi_get_device_utilization_rate": self._get_device_utilization_rate,
             "dcmi_get_device_temperature": self._get_device_temperature,
@@ -353,6 +358,21 @@ class _FakeDCMI:
 
     def _get_device_ip(self, card_id: int, device_id: int, port_type: int) -> None:
         raise self._unsupported()
+
+    def _get_device_gateway(self, card_id: int, device_id: int, port_type: int) -> None:
+        raise self._unsupported()
+
+    def _get_device_spod_info(self, card_id: int, device_id: int) -> _FakeStruct:
+        self._unit(card_id, device_id)
+        if self.super_pod is None:
+            raise self._unsupported()
+        super_pod_id, server_id, sdid, scale_type = self.super_pod
+        return _FakeStruct(
+            super_pod_id=super_pod_id,
+            server_id=server_id,
+            sdid=sdid,
+            scale_type=scale_type,
+        )
 
     def _get_affinity_cpu_info(self, card_id: int, device_id: int) -> None:
         raise self._unsupported()
@@ -791,6 +811,133 @@ def test_cann_variant_resolves_a_950_name_the_mapping_does_not_carry(soc_name):
 def test_guess_soc_name_still_yields_nothing_for_an_unknown_chip():
     assert ascend._guess_soc_name_from_dev_name("NotAnAscendChip") is None  # noqa: SLF001
     assert ascend.get_ascend_cann_variant(None) is None
+
+
+# --------------------------------------------------------------------------- #
+# Beyond the host: super pod membership and the switch behind the RoCE port.  #
+# --------------------------------------------------------------------------- #
+
+
+class _A3Unit(_Unit):
+    @property
+    def v2_chip_name(self) -> str:
+        return "910_9391"
+
+
+def test_detect_info_reports_the_super_pod_of_an_a3(fake_pydcmi):
+    fake = fake_pydcmi([_A3Unit()], super_pod=(3, 12, 96, 1))
+
+    devices = fake.units and AscendDetector().detect_info()
+
+    assert devices[0].appendix["super_pod_id"] == 3
+    assert devices[0].appendix["super_pod_server_id"] == 12
+    assert devices[0].appendix["super_pod_sdid"] == 96
+    assert devices[0].appendix["super_pod_scale_type"] == 1
+
+
+def test_detect_info_does_not_ask_an_a2_about_super_pods(fake_pydcmi):
+    # A driver that does not know the sub command may answer with zeroed
+    # fields instead of an error, and a super pod id of 0 on every A2 would
+    # read as one shared domain. So the question is not put to it at all.
+    fake = fake_pydcmi([_Unit()], super_pod=(0, 0, 0, 0))
+
+    devices = AscendDetector().detect_info()
+
+    assert "dcmi_get_device_spod_info" not in fake.calls
+    assert "super_pod_id" not in devices[0].appendix
+
+
+def test_detect_info_keeps_an_a3_outside_any_super_pod(fake_pydcmi):
+    fake_pydcmi([_A3Unit()], super_pod=None)
+
+    devices = AscendDetector().detect_info()
+
+    assert len(devices) == 1
+    assert "super_pod_id" not in devices[0].appendix
+
+
+def test_detect_info_skips_the_lldp_query_without_a_roce_address(
+    fake_pydcmi,
+    monkeypatch,
+):
+    fake_pydcmi([_Unit()])
+
+    def _must_not_run(*_args, **_kwargs):
+        msg = "hccn_tool must not be run for a port with no RoCE address"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(ascend, "execute_command", _must_not_run)
+
+    devices = AscendDetector().detect_info()
+
+    assert "roce_lldp_chassis_id" not in devices[0].appendix
+
+
+# `hccn_tool -i 0 -lldp -g` on a 910B2 cabled to a Huawei CE8875, verbatim.
+_HCCN_LLDP_OUTPUT = """Chassis ID TLV
+\tMAC: c0:f9:b0:c7:13:71
+Port ID TLV
+\tIfname: 200GE1/0/9
+Time to Live TLV
+\t120
+Port Description TLV
+\tdT:[GDSZ-PSC-ZS2F1-SPOD1-PM-OS07-IRONIC-AI-ZS-100]-FLEXIOB1-Port1-10.17.31.17
+System Name TLV
+\tGDSZ-PSC-ZS2F1-POD1-S-JR-ROCE-CE8875-50
+System Description TLV
+\tHuawei Versatile Routing Platform Software
+YunShan OS, Version 1.23.1.1 (CE8800 V300R023C10SPC500)
+Copyright (C) 2021-2024 Huawei Technologies Co., Ltd.
+HUAWEI CE8875-24BQ8DQ
+
+System Capabilities TLV
+\tSystem capabilities:  Bridge, Router
+\tEnabled capabilities: Bridge, Router
+Management Address TLV
+\tIPv4: 10.12.188.204
+\tIfindex: 4
+Port VLAN ID TLV
+\tPVID: 34
+Maximum Frame Size TLV
+\t9216
+End of LLDPDU TLV
+"""
+
+
+def test_parse_hccn_lldp_keeps_the_identity_tlvs():
+    assert ascend.parse_hccn_lldp(_HCCN_LLDP_OUTPUT) == {
+        "roce_lldp_chassis_id": "c0:f9:b0:c7:13:71",
+        "roce_lldp_port_id": "200GE1/0/9",
+        "roce_lldp_port_description": (
+            "dT:[GDSZ-PSC-ZS2F1-SPOD1-PM-OS07-IRONIC-AI-ZS-100]-FLEXIOB1-Port1-10.17.31.17"
+        ),
+        "roce_lldp_system_name": "GDSZ-PSC-ZS2F1-POD1-S-JR-ROCE-CE8875-50",
+    }
+
+
+def test_parse_hccn_lldp_yields_nothing_for_a_silent_port():
+    assert ascend.parse_hccn_lldp("") == {}
+    assert ascend.parse_hccn_lldp(None) == {}
+    assert ascend.parse_hccn_lldp("Time to Live TLV\n\t120\nEnd of LLDPDU TLV\n") == {}
+
+
+def test_detect_info_reports_the_switch_behind_the_roce_port(fake_pydcmi, monkeypatch):
+    fake = fake_pydcmi([_Unit(physical_id=5)])
+    fake._get_device_ip = lambda *_args: ("10.52.32.3", "255.255.255.0")  # noqa: SLF001
+    fake._get_device_gateway = lambda *_args: "10.52.32.1"  # noqa: SLF001
+    ran: list[list[str]] = []
+
+    def _hccn(command, _cwd=None):
+        ran.append(command)
+        return _HCCN_LLDP_OUTPUT
+
+    monkeypatch.setattr(ascend, "execute_command", _hccn)
+
+    devices = AscendDetector().detect_info()
+
+    assert ran == [["hccn_tool", "-i", "5", "-lldp", "-g"]]
+    assert devices[0].appendix["roce_lldp_chassis_id"] == "c0:f9:b0:c7:13:71"
+    assert devices[0].appendix["roce_lldp_system_name"].endswith("CE8875-50")
 
 
 # --------------------------------------------------------------------------- #

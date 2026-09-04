@@ -67,6 +67,7 @@ DCMI_MAIN_CMD_TS_GROUP_NUM = 2
 DCMI_MAIN_CMD_CAN = 3
 DCMI_MAIN_CMD_UART = 4
 DCMI_MAIN_CMD_UPGRADE = 5
+DCMI_MAIN_CMD_CHIP_INF = 12
 DCMI_MAIN_CMD_HCCS = 16
 DCMI_MAIN_CMD_TEMP = 50
 DCMI_MAIN_CMD_SVM = 51
@@ -77,6 +78,7 @@ DCMI_MAIN_CMD_MAX = 57
 
 ## Enums ##
 DCMI_SVM_SUB_CMD_CREATE = 1
+DCMI_CINF_SUB_CMD_GET_SPOD_INFO = 1
 DCMI_VMNG_SUB_CMD_GET_VDEV_RESOURCE = 0
 DCMI_VMNG_SUB_CMD_GET_TOTAL_RESOURCE = 1
 DCMI_VMNG_SUB_CMD_GET_FREE_RESOURCE = 2
@@ -1065,6 +1067,25 @@ def dcmi_get_device_info(card_id, device_id, main_cmd, sub_cmd, result):
     fn = _dcmiGetFunctionPointer("dcmi_get_device_info")
     ret = fn(card_id, device_id, main_cmd, sub_cmd, byref(result), byref(c_size))
     _dcmiCheckReturn(ret)
+
+
+def dcmi_get_device_spod_info(card_id, device_id):
+    """
+    Query the super pod an NPU belongs to (Atlas 900/800I A3 and later).
+
+    Reached through ``dcmi_get_device_info`` with the CHIP_INF main command,
+    the way mind-cluster's ``DcGetSuperPodInfo`` does; there is no dedicated
+    entry point in libdcmi. Devices outside a super pod fail the call.
+    """
+    info = c_dcmi_spod_info()
+    dcmi_get_device_info(
+        card_id,
+        device_id,
+        DCMI_MAIN_CMD_CHIP_INF,
+        DCMI_CINF_SUB_CMD_GET_SPOD_INFO,
+        info,
+    )
+    return info
 
 
 def dcmi_get_device_ip(card_id, device_id, port_type, port_id=0):
